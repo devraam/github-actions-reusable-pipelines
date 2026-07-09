@@ -1,0 +1,141 @@
+# Reusable CI pipeline for Go microservices.
+# Called via `workflow_call` from service repositories — see examples/caller.yml.
+name: go-ci
+
+on:
+  workflow_call:
+    inputs:
+      app-dir:
+        description: "Directory containing the Go module (APPDIR pattern)"
+        type: string
+        default: "."
+      go-version:
+        description: "Go toolchain version"
+        type: string
+        default: "1.22"
+      quality-gate-enabled:
+        description: "false = informative mode (report only), true = enforcing"
+        type: boolean
+        default: false
+      image-name:
+        description: "Local image name for build + scan (never pushed here)"
+        type: string
+        default: "service-under-test"
+
+env:
+  APPDIR: ${{ inputs.app-dir }}
+
+jobs:
+  resolve-ref:
+    # Resolve the checkout ref ONCE and propagate it, so every job in this run
+    # builds the exact same commit even if the branch moves mid-pipeline.
+    runs-on: ubuntu-latest
+    outputs:
+      checkout-ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - id: ref
+        run: echo "ref=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: resolve-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.checkout-ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: ${{ env.APPDIR }}
+        continue-on-error: ${{ !inputs.quality-gate-enabled }}
+
+  unit-test:
+    needs: resolve-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.checkout-ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+      - name: Run unit tests with coverage
+        working-directory: ${{ env.APPDIR }}
+        run: |
+          go test ./... -race -coverprofile=coverage.out -covermode=atomic
+          go tool cover -func=coverage.out | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
+
+  sast:
+    needs: resolve-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.checkout-ref }}
+      - name: gosec (SAST)
+        uses: securego/gosec@master
+        with:
+          args: "-no-fail -fmt sarif -out gosec.sarif ./..."
+      - name: Enforce gate
+        if: ${{ inputs.quality-gate-enabled }}
+        run: |
+          findings=$(jq '[.runs[].results[]] | length' gosec.sarif)
+          echo "SAST findings: $findings" >> "$GITHUB_STEP_SUMMARY"
+          [ "$findings" -eq 0 ] || exit 1
+
+  dependency-check:
+    needs: resolve-ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.checkout-ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+      - name: govulncheck
+        working-directory: ${{ env.APPDIR }}
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./... || ${{ !inputs.quality-gate-enabled }}
+
+  build-and-scan:
+    needs: [lint, unit-test, sast, dependency-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.checkout-ref }}
+      - name: Build image (no push)
+        working-directory: ${{ env.APPDIR }}
+        run: docker build -t ${{ inputs.image-name }}:${{ github.sha }} .
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.image-name }}:${{ github.sha }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: ${{ inputs.quality-gate-enabled && '1' || '0' }}
+
+  pipeline-report:
+    # Consolidated summary: one place to read the whole pipeline outcome.
+    if: always()
+    needs: [lint, unit-test, sast, dependency-check, build-and-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: PIPELINE_REPORT
+        run: |
+          {
+            echo "## Pipeline Report"
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Lint | ${{ needs.lint.result }} |"
+            echo "| Unit tests | ${{ needs.unit-test.result }} |"
+            echo "| SAST | ${{ needs.sast.result }} |"
+            echo "| Dependency scan | ${{ needs.dependency-check.result }} |"
+            echo "| Build + image scan | ${{ needs.build-and-scan.result }} |"
+            echo ""
+            echo "_Quality gate enforcing: **${{ inputs.quality-gate-enabled }}**_"
+          } >> "$GITHUB_STEP_SUMMARY"
