@@ -1,0 +1,17 @@
+# Example caller workflow — place in a service repo as .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: devraam/github-actions-reusable-pipelines/.github/workflows/go-ci.yml@main
+    with:
+      app-dir: "."            # APPDIR: where the Go module lives
+      go-version: "1.22"
+      quality-gate-enabled: false   # informative mode first, enforce later
+      image-name: "orders-service"
+    secrets: inherit
